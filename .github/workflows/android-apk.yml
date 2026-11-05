@@ -1,0 +1,80 @@
+name: android-apk
+
+# Personal Android test build, not part of Eglantine's own CI. Builds the Mainline release APK
+# from .ci/android's Gradle setup, renamed to dev.eglantine.eglantine so it installs next to Eden,
+# and publishes it as a pre-release on this fork.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: android-arm64 apk
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # The runner image has the SDK; add the NDK, CMake and platform the Gradle build asks for,
+      # and glslangValidator for the host shaders.
+      - name: Install Android packages
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends glslang-tools
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.31.5" > /dev/null
+
+      - name: Use the Eglantine package name and label
+        shell: bash
+        working-directory: src/android
+        run: |
+          set -euo pipefail
+          sed -i 's/applicationId = "dev.eden.eden_emulator"/applicationId = "dev.eglantine.eglantine"/' app/build.gradle.kts
+          sed -i 's/"appNameBase" to "Eden")/"appNameBase" to "Eglantine")/' app/build.gradle.kts
+          grep -n 'applicationId = \|"appNameBase" to' app/build.gradle.kts
+          grep -q 'applicationId = "dev.eglantine.eglantine"' app/build.gradle.kts
+
+      - name: Build APK
+        shell: bash
+        working-directory: src/android
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleMainlineRelease
+          apk=$(find app/build/outputs/apk/mainline/release -name '*.apk' | head -1)
+          test -n "$apk"
+          cp "$apk" "$GITHUB_WORKSPACE/eglantine-android-arm64.apk"
+          ls -l "$GITHUB_WORKSPACE/eglantine-android-arm64.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: eglantine-android-arm64-${{ github.sha }}
+          path: eglantine-android-arm64.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Publish pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="android-${GITHUB_SHA::7}"
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2> /dev/null || true
+          gh release create "$tag" eglantine-android-arm64.apk --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "Eglantine Android test build (${GITHUB_SHA::7})" \
+            --notes "Personal Android test build of nx2 at ${GITHUB_SHA::7}, installed as dev.eglantine.eglantine (Android 13 or newer, arm64). Not an official Eglantine release: upstream has paused its Android builds."
