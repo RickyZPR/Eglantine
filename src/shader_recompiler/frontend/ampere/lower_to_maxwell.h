@@ -2158,7 +2158,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             break;
         }
-        case 0xb63: case 0xf63: { // TLD4 (gather), 2D without offsets or depth compare; component at bits 87-88.
+        case 0xb63: case 0xf63: { // TLD4 (gather), 2D; component at bits 87-88.
             // 0xf63: the handle in a uniform register (bit 91), Maxwell TLD4.B with the handle in Rb.
             const bool bindless = opcode == 0xf63;
             const u32 handle = bindless ? uniform_register(insn.Bits(40, 6)) : 255;
@@ -2168,6 +2168,51 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Bit 76: a texel offset after the coordinates (x, y in Ra, Ra+1, offsets in Rb, as
             // for TEX); Maxwell TLD4 takes it as AOFFI (bits 54-55) from Rb.
             const bool offsets = insn.Bits(76, 1) != 0;
+            if (insn.Bits(77, 3)) {
+                // Bit 77: four per-tap offsets (PTP) in two registers; bit 78: depth comparison
+                // (bit 79, FP16 results, is handled before this). The operand list is the
+                // coordinates, the offset registers, then the reference, packed as for TEX: up to
+                // four values split evenly over Ra and Rb, five or more as four in Ra, rest in Rb.
+                const bool ptp = insn.Bits(77, 1) != 0, depth_compare = insn.Bits(78, 1) != 0;
+                const u32 offset_count = ptp ? 2U : offsets ? 1U : 0U;
+                const u32 count = 2 + offset_count + (depth_compare ? 1U : 0U);
+                const u32 in_a = count <= 4 ? (count + 1) / 2 : 4;
+                const auto value = [&](u32 i) -> u32 {
+                    if (i < in_a) return source_a == 255 ? 255U : source_a + i;
+                    return source_b == 255 ? 255U : source_b + (i - in_a);
+                };
+                if (bindless || (offsets && ptp) || insn.Bits(79, 1) || insn.Bits(61, 3) != 1 || insn.Bits(81, 3) != 7 ||
+                    insn.Bits(59, 1) || insn.Bits(89, 1) || mask == 0 ||
+                    (source_a != 255 && source_a + in_a > 246) ||
+                    (source_b != 255 && source_b + (count - in_a) > 246) ||
+                    insn.Bits(40, 14) > 0x1fff || binding >= 18 ||
+                    (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding))
+                    return fail(index, "native texture gather mode");
+                result.required_texture_buffer = binding;
+                const auto copy = [&](u32 target, u32 source) {
+                    emit(0x5c98000000000000ULL | predicate | target | (u64{15} << 39) | (u64{source} << 20));
+                };
+                // Coordinates to R250, R251; the offset registers, then the reference, to R246...
+                copy(250, value(0));
+                copy(251, value(1));
+                u32 meta = 246;
+                for (u32 i = 0; i < offset_count; ++i) copy(meta++, value(2 + i));
+                if (depth_compare) copy(meta++, value(2 + offset_count));
+                emit(0xc800000000000000ULL | predicate | 250 | (u64{250} << 8) |
+                     (u64{meta == 246 ? 255U : 246U} << 20) | (u64{2} << 28) | (u64{mask} << 31) |
+                     (u64{insn.Bits(40, 14)} << 36) | (u64{insn.Bits(90, 1)} << 49) |
+                     (u64{depth_compare ? 1U : 0U} << 50) | (u64{7} << 51) |
+                     (u64{ptp ? 2U : offsets ? 1U : 0U} << 54) | (u64{insn.Bits(87, 2)} << 56));
+                const u32 components = static_cast<u32>(std::popcount(mask));
+                const bool split = second_dest != 255;
+                for (u32 i = 0; i < components; ++i) {
+                    u32 target = 255;
+                    if (!split || i < 2) target = dest == 255 ? 255U : static_cast<u32>(dest) + i;
+                    else target = second_dest + (i - 2);
+                    if (target != 255) copy(target, 250 + i);
+                }
+                break;
+            }
             if (insn.Bits(61, 3) != 1 || insn.Bits(77, 3) || insn.Bits(81, 3) != 7 || insn.Bits(59, 1) ||
                 (offsets && (bindless || source_b == 255 || (source_a != 255 && source_a >= 245))) ||
                 insn.Bits(89, 1) || mask == 0 ||
